@@ -1,7 +1,7 @@
 {
   "id": "feishu-comment",
   "name": "飞书评论",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "minAppVersion": "1.4.0",
   "description": "在 Markdown 笔记中添加类似飞书云文档的评论功能，支持选中文字、线程回复、解决状态。",
   "author": "鲸鱼",

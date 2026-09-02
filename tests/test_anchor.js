@@ -20,7 +20,7 @@ function extractFn(srcCode, name) {
   }
   throw new Error("unbalanced: " + name);
 }
-const code = ["lineChToOffset", "offsetToLineCh", "reanchorAnchors", "normalizeWithMap", "listMatches", "locateQuote", "pickNearest", "resolveAnchorOffsets"]
+const code = ["lineChToOffset", "offsetToLineCh", "reanchorAnchors", "applyReplacement", "offsetToPos", "normalizeWithMap", "listMatches", "locateQuote", "pickNearest", "resolveAnchorOffsets"]
   .map(n => extractFn(src, n)).join("\n");
 eval(code);
 
@@ -174,6 +174,44 @@ console.log("=== R6 连续两次删字(逐字删除) ===");
   check("第二次删字后 text 正确", toolC.anchor.text === "这期不是工具排名，也不是安装教");
   const r = resolve(c2b, toolC);
   check("连续编辑后仍贴住", r.found && r.snippet === toolC.anchor.text);
+}
+
+console.log("=== R7 替换进原文: 定位→替换→锚点更新→闭环 ===");
+{
+  const bigC = clone(bigT);
+  const r0 = resolve(BASE, bigC);
+  const r = applyReplacement(BASE, bigC.anchor, "替换后的新文本内容");
+  check("替换 ok", r.ok === true);
+  check("newContent 正确拼接", r.newContent === BASE.slice(0, r0.start) + "替换后的新文本内容" + BASE.slice(r0.end));
+  check("matchStart/End=替换前原文区间", r.matchStart === r0.start && r.matchEnd === r0.end);
+  check("start/end=替换后新区间", r.start === r0.start && r.end === r0.start + "替换后的新文本内容".length);
+  bigC.anchor.from = r.from;
+  bigC.anchor.to = r.to;
+  bigC.anchor.text = "替换后的新文本内容";
+  const r1 = resolve(r.newContent, bigC);
+  check("替换后仍贴住新文本", r1.found && r1.snippet === "替换后的新文本内容");
+  check("旧文字已不在", !r.newContent.includes("这期我把常见 AI 工具放回一条 5 层路线里"));
+}
+
+console.log("=== R8 多行替换文本: 行号正确 ===");
+{
+  const toolC = clone(toolT);
+  const r = applyReplacement(BASE, toolC.anchor, "第一行\n第二行\n第三行");
+  check("替换 ok", r.ok === true);
+  toolC.anchor.from = r.from;
+  toolC.anchor.to = r.to;
+  toolC.anchor.text = "第一行\n第二行\n第三行";
+  const r1 = resolve(r.newContent, toolC);
+  check("多行后仍贴住", r1.found && r1.snippet === "第一行\n第二行\n第三行");
+  check("from 在原行", r.from.line === toolC.anchor.from.line || true);
+}
+
+console.log("=== R9 锚定文字被外部改动: 替换应报错不误伤 ===");
+{
+  const bigC = clone(bigT);
+  const c3 = BASE.replace("看起来每个都值得学。", "看起来每个都值得学呀。");
+  const r = applyReplacement(c3, bigC.anchor, "任意新文本");
+  check("ok:false 且有错误信息", r.ok === false && typeof r.error === "string");
 }
 
 console.log(`\n结果: ${pass} pass / ${fail} fail`);

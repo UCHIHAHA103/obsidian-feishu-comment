@@ -75,17 +75,30 @@ var CommentStore = class {
     thread.replies.push(reply);
     await this.save();
   }
+  async deleteReply(notePath, threadId, replyId) {
+    const threads = this.db[notePath];
+    if (!threads) return;
+    const t = threads.find((x) => x.id === threadId);
+    if (!t) return;
+    t.replies = t.replies.filter((r) => r.id !== replyId);
+    if (t.replies.length === 0) {
+      this.db[notePath] = this.db[notePath].filter((x) => x.id !== threadId);
+      if (this.db[notePath].length === 0) delete this.db[notePath];
+    }
+    await this.save();
+  }
 };
 
 // src/comment-modal.ts
 var import_obsidian = require("obsidian");
 var CommentInputModal = class extends import_obsidian.Modal {
-  constructor(app, onSubmit, title = "\u6DFB\u52A0\u8BC4\u8BBA", placeholder = "\u8F93\u5165\u8BC4\u8BBA\u5185\u5BB9...", submitOnEnter = true) {
+  constructor(app, onSubmit, title = "\u6DFB\u52A0\u8BC4\u8BBA", placeholder = "\u8F93\u5165\u8BC4\u8BBA\u5185\u5BB9...", submitOnEnter = true, initialValue = "") {
     super(app);
     this.onSubmit = onSubmit;
     this.title = title;
     this.placeholder = placeholder;
     this.submitOnEnter = submitOnEnter;
+    this.initialValue = initialValue;
   }
   onOpen() {
     const { contentEl } = this;
@@ -134,13 +147,22 @@ var CommentInputModal = class extends import_obsidian.Modal {
     ).addButton(
       (btn) => btn.setButtonText("\u53D6\u6D88").onClick(() => this.close())
     );
+    if (this.initialValue) {
+      this.textarea.value = this.initialValue;
+    }
     this.captureFocus();
   }
   // 焦点健壮化: 多阶段重试 focus + blur 守卫 + 点空白聚焦, 防焦点被 Obsidian 内部流程抢走
   captureFocus() {
     const focusNow = () => {
       try {
-        if (this.textarea && this.textarea.isConnected) this.textarea.focus();
+        if (this.textarea && this.textarea.isConnected) {
+          this.textarea.focus();
+          if (this.initialValue) {
+            const L = this.textarea.value.length;
+            this.textarea.setSelectionRange(L, L);
+          }
+        }
       } catch (e) {
       }
     };
@@ -148,16 +170,34 @@ var CommentInputModal = class extends import_obsidian.Modal {
     requestAnimationFrame(() => focusNow());
     setTimeout(focusNow, 100);
     setTimeout(focusNow, 400);
+    const focusIsOutside = () => {
+      const ae = document.activeElement;
+      if (ae === this.textarea) return false;
+      if (ae && this.modalEl && this.modalEl.contains(ae)) return false;
+      return true;
+    };
     this.focusGuard = () => {
       setTimeout(() => {
         if (!this.textarea || !this.textarea.isConnected) return;
-        const ae = document.activeElement;
-        if (ae === this.textarea) return;
-        if (ae && this.modalEl && this.modalEl.contains(ae)) return;
+        if (!focusIsOutside()) return;
         focusNow();
       }, 120);
     };
     this.textarea.addEventListener("blur", this.focusGuard);
+    // 守护2: 打开期间周期检查, 焦点被抢到弹窗外则拉回 (覆盖 textarea 从未聚焦成功→无 blur 事件的盲区)
+    this.focusTimer = window.setInterval(() => {
+      if (!this.textarea || !this.textarea.isConnected) return;
+      if (!focusIsOutside()) return;
+      focusNow();
+    }, 500);
+    // 守护3: 键盘兜底 - 弹窗外按键时先拉回焦点, 让字符落在输入框
+    this.keyGuard = (e) => {
+      if (!e.key || e.key.length !== 1) return;
+      if (!this.textarea || !this.textarea.isConnected) return;
+      if (!focusIsOutside()) return;
+      focusNow();
+    };
+    document.addEventListener("keydown", this.keyGuard, true);
     this.contentEl.addEventListener("mousedown", (e) => {
       if (e.target === this.contentEl || e.target === this.modalEl) {
         e.preventDefault();
@@ -175,6 +215,14 @@ var CommentInputModal = class extends import_obsidian.Modal {
     this.close();
   }
   onClose() {
+    if (this.keyGuard) {
+      document.removeEventListener("keydown", this.keyGuard, true);
+      this.keyGuard = null;
+    }
+    if (this.focusTimer) {
+      clearInterval(this.focusTimer);
+      this.focusTimer = null;
+    }
     if (this.textarea && this.focusGuard) {
       this.textarea.removeEventListener("blur", this.focusGuard);
       this.focusGuard = null;
@@ -182,6 +230,42 @@ var CommentInputModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+
+// Obsidian 风格确认框: 替代原生 confirm()/alert() (Electron 中原生阻塞对话框会损坏窗口焦点状态,
+// 导致后续 modal 无法聚焦输入, 直到窗口焦点被外部扰动才恢复)
+var ConfirmModal = class extends import_obsidian.Modal {
+  constructor(app, message, onResult) {
+    super(app);
+    this.message = message;
+    this.onResult = onResult;
+    this.confirmed = false;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("feishu-comment-confirm");
+    contentEl.createEl("p", {
+      cls: "feishu-comment-confirm-message",
+      text: this.message
+    });
+    const btns = contentEl.createEl("div", { cls: "feishu-comment-confirm-buttons" });
+    btns.createEl("button", { text: "\u786E\u5B9A", cls: "mod-cta" }).addEventListener("click", () => {
+      this.confirmed = true;
+      this.close();
+    });
+    btns.createEl("button", { text: "\u53D6\u6D88" }).addEventListener("click", () => {
+      this.close();
+    });
+  }
+  onClose() {
+    this.onResult(this.confirmed);
+    this.contentEl.empty();
+  }
+};
+function showConfirm(app, message) {
+  return new Promise((resolve) => {
+    new ConfirmModal(app, message, (ok) => resolve(ok)).open();
+  });
+}
 
 // src/comment-view.ts
 var import_obsidian2 = require("obsidian");
@@ -439,18 +523,10 @@ var CommentSidebarView = class extends import_obsidian2.ItemView {
     );
     const body = card.createEl("div", { cls: "feishu-comment-body" });
     for (const reply of thread.replies) {
-      this.renderReplyItem(body, reply);
+      this.renderReplyItem(body, reply, notePath, thread);
     }
     const actions = card.createEl("div", { cls: "feishu-comment-actions" });
-    const iconBtn = (parent2, svgPath, title, danger = false) => {
-      const btn = parent2.createEl("button");
-      btn.setAttribute("title", title);
-      btn.setAttribute("aria-label", title);
-      if (danger) btn.addClass("feishu-btn-danger");
-      btn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${svgPath}</svg>`;
-      return btn;
-    };
-    iconBtn(
+    this.iconBtn(
       actions,
       '<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
       "\u56DE\u590D"
@@ -474,32 +550,92 @@ var CommentSidebarView = class extends import_obsidian2.ItemView {
     const isResolved = thread.status === "resolved";
     const toggleTitle = isResolved ? "\u91CD\u5F00" : "\u89E3\u51B3";
     const togglePath = isResolved ? '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>' : '<polyline points="20 6 9 17 4 12"/>';
-    iconBtn(actions, togglePath, toggleTitle).addEventListener("click", async () => {
+    this.iconBtn(actions, togglePath, toggleTitle).addEventListener("click", async () => {
       const newStatus = isResolved ? "reopened" : "resolved";
       await this.store.updateThread(notePath, thread.id, { status: newStatus });
       this.render();
     });
-    iconBtn(
+    this.iconBtn(
       actions,
       '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>',
       "\u5220\u9664",
       true
     ).addEventListener("click", async () => {
-      if (confirm("\u5220\u9664\u6574\u4E2A\u8BC4\u8BBA\u7EBF\u7A0B\uFF1F\u6B64\u64CD\u4F5C\u4E0D\u53EF\u6062\u590D\u3002")) {
+      if (await showConfirm(this.app, "\u5220\u9664\u6574\u4E2A\u8BC4\u8BBA\u7EBF\u7A0B\uFF1F\u6B64\u64CD\u4F5C\u4E0D\u53EF\u6062\u590D\u3002")) {
         await this.store.deleteThread(notePath, thread.id);
         this.render();
       }
     });
   }
-  renderReplyItem(parent, reply) {
-    const item = parent.createEl("div", { cls: "feishu-comment-item" });
+  iconBtn(parent2, svgPath, title, danger = false) {
+    const btn = parent2.createEl("button");
+    btn.setAttribute("title", title);
+    btn.setAttribute("aria-label", title);
+    if (danger) btn.addClass("feishu-btn-danger");
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${svgPath}</svg>`;
+    return btn;
+  }
+  renderReplyItem(parent, reply, notePath, thread) {
+    const item = parent.createEl("div", { cls: "feishu-comment-reply" });
     item.createEl("span", {
       cls: "feishu-comment-time",
       text: this.formatTime(reply.createdAt)
     });
     item.createEl("div", {
-      cls: "feishu-comment-content",
+      cls: "feishu-comment-content" + (reply.resolved ? " feishu-comment-reply-resolved" : ""),
       text: reply.content
+    });
+    const actions = item.createEl("div", { cls: "feishu-comment-reply-actions" });
+    this.iconBtn(
+      actions,
+      '<path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+      "\u66FF\u6362\u8FDB\u539F\u6587"
+    ).addEventListener("click", async () => {
+      if (!(await showConfirm(this.app, "\u5C06\u539F\u6587\u66FF\u6362\u4E3A\u8BE5\u8BC4\u8BBA\u5185\u5BB9\uFF1F\u6B64\u64CD\u4F5C\u4F1A\u4FEE\u6539\u6587\u6863\uFF08\u7F16\u8F91\u5668\u5185\u53EF\u64A4\u9500\uFF09\u3002"))) return;
+      const res = await this.plugin.replaceOriginal(notePath, thread, reply);
+      if (!res.ok) {
+        new import_obsidian2.Notice(res.error);
+        return;
+      }
+      this.render();
+    });
+    const rTitle = reply.resolved ? "\u91CD\u65B0\u6253\u5F00" : "\u6807\u8BB0\u5DF2\u89E3\u51B3";
+    const rPath = reply.resolved ? '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>' : '<polyline points="20 6 9 17 4 12"/>';
+    this.iconBtn(actions, rPath, rTitle).addEventListener("click", async () => {
+      reply.resolved = !reply.resolved;
+      await this.plugin.store.save();
+      this.render();
+    });
+    this.iconBtn(
+      actions,
+      '<path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+      "\u7F16\u8F91\u8BC4\u8BBA"
+    ).addEventListener("click", () => {
+      new CommentInputModal(
+        this.app,
+        async (text) => {
+          const t = text.trim();
+          if (!t) return;
+          reply.content = t;
+          await this.plugin.store.save();
+          this.render();
+        },
+        "\u7F16\u8F91\u8BC4\u8BBA",
+        "\u8F93\u5165\u8BC4\u8BBA\u5185\u5BB9...",
+        true,
+        reply.content
+      ).open();
+    });
+    this.iconBtn(
+      actions,
+      '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>',
+      "\u5220\u9664",
+      true
+    ).addEventListener("click", async () => {
+      if (await showConfirm(this.app, "\u5220\u9664\u8BE5\u6761\u8BC4\u8BBA\uFF1F")) {
+        await this.plugin.store.deleteReply(notePath, thread.id, reply.id);
+        this.render();
+      }
     });
   }
   jumpToAnchor(anchor, threadId) {
@@ -688,6 +824,34 @@ function resolveAnchorOffsets(doc, anchor) {
   }
   const best = pickNearest(matches, fallback.start);
   return { start: best.start, end: best.end, found: true };
+}
+// 替换核心: 在 content 中定位 anchor 引用文字并用 newText 替换, 返回新内容与新锚点坐标
+function applyReplacement(content, anchor, newText) {
+  const text = anchor && typeof anchor.text === "string" ? anchor.text : "";
+  if (!text.trim()) return { ok: false, error: "\u951A\u70B9\u6587\u672C\u4E22\u5931\uFF0C\u65E0\u6CD5\u66FF\u6362" };
+  const matches = listMatches(content, text);
+  if (!matches.length) return { ok: false, error: "\u5F15\u7528\u539F\u6587\u672A\u5728\u6587\u6863\u4E2D\u627E\u5230\uFF0C\u65E0\u6CD5\u66FF\u6362" };
+  const around = (() => {
+    const ls = content.split("\n");
+    let off = 0;
+    for (let i = 0; i < ls.length; i++) {
+      if (i === anchor.from.line) return off + Math.min(Math.max(0, anchor.from.ch), ls[i].length);
+      off += ls[i].length + 1;
+    }
+    return 0;
+  })();
+  const m = pickNearest(matches, around);
+  const newContent = content.slice(0, m.start) + newText + content.slice(m.end);
+  return {
+    ok: true,
+    newContent,
+    matchStart: m.start,
+    matchEnd: m.end,
+    start: m.start,
+    end: m.start + newText.length,
+    from: offsetToPos(newContent, m.start),
+    to: offsetToPos(newContent, m.start + newText.length)
+  };
 }
 
 // src/main.ts
@@ -938,7 +1102,7 @@ var FeishuCommentPlugin = class extends import_obsidian3.Plugin {
       return sendJson(400, { ok: false, error: "bad url" });
     }
     if (req.method === "GET" && url.pathname === "/health") {
-      return sendJson(200, { ok: true, plugin: "feishu-comment", version: "0.4.0" });
+      return sendJson(200, { ok: true, plugin: "feishu-comment", version: "0.6.0" });
     }
     if (req.method === "GET" && url.pathname === "/comments") {
       const f = url.searchParams.get("file") || "";
@@ -975,7 +1139,79 @@ var FeishuCommentPlugin = class extends import_obsidian3.Plugin {
       this.bumpAndRefresh();
       return sendJson(200, { ok: true, file: file.path, deleted: threadId });
     }
+    if (req.method === "PATCH" && url.pathname === "/thread") {
+      const f = url.searchParams.get("file") || "";
+      const threadId = url.searchParams.get("threadId") || "";
+      const status = url.searchParams.get("status") || "";
+      const file = this.resolveFile(f);
+      if (!file) return sendJson(404, { ok: false, error: "file not found: " + f });
+      const threads = this.store.getThreads(file.path);
+      if (!threads.some((t) => t.id === threadId)) {
+        return sendJson(404, { ok: false, error: "thread not found: " + threadId + " in " + file.path });
+      }
+      if (status !== "resolved" && status !== "reopened") {
+        return sendJson(400, { ok: false, error: "status must be resolved or reopened" });
+      }
+      await this.store.updateThread(file.path, threadId, { status });
+      this.bumpAndRefresh();
+      return sendJson(200, { ok: true, file: file.path, threadId, status });
+    }
+    if (req.method === "DELETE" && url.pathname === "/reply") {
+      const f = url.searchParams.get("file") || "";
+      const threadId = url.searchParams.get("threadId") || "";
+      const replyId = url.searchParams.get("replyId") || "";
+      const file = this.resolveFile(f);
+      if (!file) return sendJson(404, { ok: false, error: "file not found: " + f });
+      const thread = this.store.getThreads(file.path).find((t) => t.id === threadId);
+      if (!thread) return sendJson(404, { ok: false, error: "thread not found: " + threadId + " in " + file.path });
+      if (!thread.replies.some((r) => r.id === replyId)) {
+        return sendJson(404, { ok: false, error: "reply not found: " + replyId });
+      }
+      await this.store.deleteReply(file.path, threadId, replyId);
+      this.bumpAndRefresh();
+      return sendJson(200, { ok: true, file: file.path, threadId, deleted: replyId });
+    }
+    if ((req.method === "PATCH" && url.pathname === "/reply") || (req.method === "POST" && url.pathname === "/replace")) {
+      let raw = "";
+      req.on("data", (c) => {
+        raw += c;
+      });
+      req.on("end", () => {
+        try {
+          const body = JSON.parse(raw || "{}");
+          void this.handleReplyOp(req.method === "PATCH" ? "PATCH" : "REPLACE", body, sendJson);
+        } catch (e) {
+          sendJson(400, { ok: false, error: "bad json: " + e.message });
+        }
+      });
+      return;
+    }
     sendJson(404, { ok: false, error: "not found" });
+  }
+  async handleReplyOp(op, body, sendJson) {
+    const file = this.resolveFile(typeof body.file === "string" ? body.file : "");
+    if (!file) return sendJson(404, { ok: false, error: "file not found: " + (body.file || "<active file>") });
+    const threadId = typeof body.threadId === "string" ? body.threadId.trim() : "";
+    const replyId = typeof body.replyId === "string" ? body.replyId.trim() : "";
+    const thread = this.store.getThreads(file.path).find((t) => t.id === threadId);
+    if (!thread) return sendJson(404, { ok: false, error: "thread not found: " + threadId + " in " + file.path });
+    const reply = thread.replies.find((r) => r.id === replyId);
+    if (!reply) return sendJson(404, { ok: false, error: "reply not found: " + replyId + " in thread " + threadId });
+    if (op === "PATCH") {
+      const hasContent = typeof body.content === "string" && body.content.trim();
+      if (!hasContent && typeof body.resolved !== "boolean") {
+        return sendJson(400, { ok: false, error: "content or resolved is required" });
+      }
+      if (hasContent) reply.content = body.content.trim();
+      if (typeof body.resolved === "boolean") reply.resolved = body.resolved;
+      await this.store.save();
+      this.bumpAndRefresh();
+      return sendJson(200, { ok: true, file: file.path, threadId, replyId });
+    }
+    const res = await this.replaceOriginal(file.path, thread, reply);
+    if (!res.ok) return sendJson(400, { ok: false, error: res.error });
+    this.bumpAndRefresh();
+    return sendJson(200, { ok: true, file: file.path, threadId, replyId, replacedWith: (reply.content || "").replace(/\s+$/, "") });
   }
   async handleAddComment(body, sendJson) {
     const quote = typeof body.quote === "string" ? body.quote.trim() : "";
@@ -992,11 +1228,29 @@ var FeishuCommentPlugin = class extends import_obsidian3.Plugin {
     }
     const from = offsetToPos(content, match.start);
     const to = offsetToPos(content, match.end);
+    const anchorText = content.slice(match.start, match.end);
     const author = typeof body.author === "string" && body.author.trim() ? body.author.trim() : "WorkBuddy";
     const now = new Date().toISOString();
+    const wantThreadId = typeof body.threadId === "string" ? body.threadId.trim() : "";
+    if (wantThreadId || body.merge === true) {
+      const threads = this.store.getThreads(file.path);
+      let target = null;
+      if (wantThreadId) {
+        target = threads.find((t) => t.id === wantThreadId) || null;
+        if (!target) return sendJson(404, { ok: false, error: "thread not found: " + wantThreadId + " in " + file.path });
+      } else {
+        target = threads.find((t) => t.status !== "resolved" && t.anchor.text === anchorText) || null;
+      }
+      if (target) {
+        const reply = { id: "rp_" + Date.now(), author, content: comment, createdAt: now };
+        await this.store.addReply(file.path, target.id, reply);
+        this.bumpAndRefresh();
+        return sendJson(200, { ok: true, file: file.path, threadId: target.id, merged: true });
+      }
+    }
     const thread = {
       id: "ct_" + Date.now(),
-      anchor: { from, to, text: content.slice(match.start, match.end) },
+      anchor: { from, to, text: anchorText },
       status: "open",
       createdAt: now,
       createdBy: author,
@@ -1028,6 +1282,40 @@ var FeishuCommentPlugin = class extends import_obsidian3.Plugin {
     const lower = s.toLowerCase().replace(/\.md$/, "");
     const all = this.app.vault.getMarkdownFiles();
     return all.find((p) => p.path.toLowerCase().replace(/\.md$/, "") === lower) || all.find((p) => p.basename.toLowerCase().replace(/\.md$/, "") === lower) || all.find((p) => p.path.toLowerCase().endsWith("/" + lower)) || null;
+  }
+  // 把评论内容替换进原文锚点位置 (AI 修改示意 → 人工确认 → 落文)
+  async replaceOriginal(filePath, thread, reply) {
+    const newText = (reply.content || "").replace(/\s+$/, "");
+    if (!newText.trim()) return { ok: false, error: "\u8BC4\u8BBA\u5185\u5BB9\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u66FF\u6362" };
+    try {
+      const leaf = this.app.workspace.getLeavesOfType("markdown").find((l) => l.view?.file?.path === filePath);
+      const editor = leaf?.view?.editor;
+      if (editor) {
+        const doc = editor.cm.state.doc;
+        const r = applyReplacement(doc.toString(), thread.anchor, newText);
+        if (!r.ok) return r;
+        editor.replaceRange(newText, editor.offsetToPos(r.matchStart), editor.offsetToPos(r.matchEnd));
+        thread.anchor.from = editor.offsetToPos(r.start);
+        thread.anchor.to = editor.offsetToPos(r.end);
+        thread.anchor.text = newText;
+        this.bumpAndRefresh();
+      } else {
+        const file = this.app.vault.getAbstractFileByPath(filePath);
+        if (!file) return { ok: false, error: "\u627E\u4E0D\u5230\u6587\u4EF6: " + filePath };
+        const content = await this.app.vault.read(file);
+        const r = applyReplacement(content, thread.anchor, newText);
+        if (!r.ok) return r;
+        await this.app.vault.modify(file, r.newContent);
+        thread.anchor.from = r.from;
+        thread.anchor.to = r.to;
+        thread.anchor.text = newText;
+        this.bumpAndRefresh();
+      }
+      await this.store.save();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    }
   }
   async onunload() {
     if (this.persistTimer) {

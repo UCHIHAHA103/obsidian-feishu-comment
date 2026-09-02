@@ -76,6 +76,67 @@
   color: var(--text-faint);
 }
 
+.feishu-comment-reply {
+  position: relative;
+  padding: 4px 0;
+}
+
+.feishu-comment-reply-actions {
+  position: absolute;
+  top: 2px;
+  right: 0;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  background: var(--background-primary);
+  border-radius: 6px;
+  padding: 2px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.feishu-comment-reply:hover .feishu-comment-reply-actions {
+  opacity: 1;
+}
+
+.feishu-comment-reply-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.feishu-comment-reply-actions button:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.feishu-comment-reply-actions .feishu-btn-danger:hover {
+  color: var(--text-error);
+}
+
+.feishu-comment-reply-resolved {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
+.feishu-comment-confirm-message {
+  margin: 0 0 4px;
+  white-space: pre-wrap;
+}
+
+.feishu-comment-confirm-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 .feishu-comment-body {
   margin-bottom: 4px;
 }

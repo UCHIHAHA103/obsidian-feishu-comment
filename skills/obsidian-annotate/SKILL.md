@@ -17,14 +17,18 @@ curl -s -m 3 http://127.0.0.1:27240/health
 # 期望: {"ok":true,"plugin":"feishu-comment",...}
 ```
 
-## API 契约
+## API 契约（插件 >= 0.6.0）
 
 | 端点 | 说明 |
 |---|---|
-| `POST /comment` | 对文档局部句子下评论 |
-| `GET /comments?file=<路径>` | 读某文档全部评论 |
-| `DELETE /comment?file=<路径>&threadId=<id>` | 删除一条评论（发错自纠用） |
-| `GET /health` | 探活 |
+| `POST /comment` | 下发评论（body 可带 `threadId`/`merge` 并入已有线程） |
+| `GET /comments?file=<路径>` | 读某文档全部线程（含 anchor/status/replies） |
+| `DELETE /comment?file=<路径>&threadId=<id>` | 删除整条评论线程（发错自纠用） |
+| `PATCH /thread?file=<路径>&threadId=<id>&status=resolved\|reopened` | 解决 / 重开线程 |
+| `PATCH /reply` | 编辑回复：body `{file, threadId, replyId, content?, resolved?}`（content 与 resolved 至少一项） |
+| `DELETE /reply?file=<路径>&threadId=<id>&replyId=<rid>` | 删除单条回复 |
+| `POST /replace` | 替换进原文：body `{file, threadId, replyId}`，把该回复内容落文（等同 UI 的「替换进原文」） |
+| `GET /health` | 探活（返回插件版本号） |
 
 `POST /comment` body（JSON）：
 
@@ -36,8 +40,32 @@ curl -s -m 3 http://127.0.0.1:27240/health
 | `author` | 否 | 默认 `WorkBuddy` |
 | `occurrence` | 否 | quote 出现多次时指定第 N 处（默认 1） |
 | `open` | 否 | `true` 时在 Obsidian 中打开该文件 |
+| `merge` | 否 | `true` 时若同文件同 quote 同 occurrence 已有未解决线程，自动追加为该线程的回复；不存在则新建线程 |
+| `threadId` | 否 | 显式指定追加到的线程 ID（优先级高于 merge） |
 
-成功返回 `{"ok":true,"threadId":"...","from":...,"to":...}`；quote 找不到返回 404 + hint。
+成功返回 `{"ok":true,"threadId":"...","from":...,"to":...}`；合并到已有线程时额外返回 `"merged":true`。quote 找不到返回 404 + hint。
+
+## 评论管理操作（curl 速查）
+
+```bash
+# 解决 / 重开线程
+curl -s -X PATCH "http://127.0.0.1:27240/thread?file=<file>&threadId=<tid>&status=resolved"
+
+# 编辑回复内容 / 标记已解决
+curl -s -X PATCH http://127.0.0.1:27240/reply -H "Content-Type: application/json" \
+  -d '{"file":"<file>","threadId":"<tid>","replyId":"<rid>","content":"新内容","resolved":true}'
+
+# 删除单条回复
+curl -s -X DELETE "http://127.0.0.1:27240/reply?file=<file>&threadId=<tid>&replyId=<rid>"
+
+# 替换进原文（把回复内容落文）
+curl -s -X POST http://127.0.0.1:27240/replace -H "Content-Type: application/json" \
+  -d '{"file":"<file>","threadId":"<tid>","replyId":"<rid>"}'
+```
+
+管理操作规范：
+- 发错评论自纠优先级：改内容用 PATCH /reply，单条作废用 DELETE /reply，整组作废用 DELETE /comment。不要留给用户手动清。
+- `POST /replace` 会**直接修改原文**。建议式批注工作流中 AI **不得主动调用**——替换落文是用户人工判断后的动作；仅当用户明确指示（如"把第 N 条示意落文"）才可执行。
 
 ## 批注工作流（建议式）
 
@@ -45,15 +73,24 @@ curl -s -m 3 http://127.0.0.1:27240/health
 
 1. **先读文件**：用 Read 工具读目标 md 的绝对路径（本机默认 vault：`C:\Users\Admin\Documents\鲸鱼的文档\<相对路径>`；其他环境替换为实际 vault 路径）。
 2. **通读找修改点**：定位需要改进的句子/段落。是"找问题"，不是全文重写；没问题的地方不要硬凑建议。
-3. **每个修改点下发一组评论**（同一段原文，各自独立一条评论，均用相同 quote 和 occurrence）：
+3. **每个修改点下发一组评论**（同一段原文共用一个线程：同 quote 同 occurrence，带 `merge:true` 自动并入同一线程成为多条回复）：
    - **第 1 条：说明**（给人看的）——直接写这段话有什么问题、应该怎么改（可含理由与方向），不加前缀、不加包裹。
    - **第 2 条起：修改示意**（可落文的）——**纯正文**，直接放修改后的内容，用户会点这条的「替换进原文」逐字写入原文。
-4. **逐条 curl POST**：
+4. **批量下发**（推荐固化脚本，自动 merge + 404 定位 + 回读验证）：
+
+```bash
+# items 为 JSON 数组：[{"quote":"...","comment":"..."},...]（可选 author/occurrence 字段）
+"C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe" \
+  "C:/Users/Admin/.workbuddy/skills/obsidian-annotate/scripts/post_comments.py" \
+  --file "<vault相对路径>" < items.json
+```
+
+或逐条 curl（注意带 `merge:true`，否则同 quote 会散成多个独立线程）：
 
 ```bash
 curl -s -X POST http://127.0.0.1:27240/comment \
   -H "Content-Type: application/json" \
-  -d '{"file":"<vault相对路径>","quote":"<原文片段>","comment":"<评论内容>","author":"WorkBuddy"}'
+  -d '{"file":"<vault相对路径>","quote":"<原文片段>","comment":"<评论内容>","author":"WorkBuddy","merge":true}'
 ```
 
 5. **失败处理**：404（quote 未命中）→ 对照原文调整 quote 重试；确认不再需要的错误评论用 DELETE 删除，不要留给用户手动清。
@@ -86,7 +123,7 @@ curl -s -X POST http://127.0.0.1:27240/comment \
 - `quote` 必须从 Read 到的内容**逐字复制**（含标点、全半角、空格、md 标记）；禁止改写、禁止用省略号截断。空白/换行差异与 `&nbsp;` 实体会被自动容忍。
 - 说明要具体可执行：指出问题 + 给出方向，不写「这里不好」式的空话；AI 的判断标注为建议，最终以用户判断为准。
 - 评论跟随原文：用户随后增删文字，下划线与引用文字自动同步，AI 无需干预；只有文档被外部程序整体改动导致引用失效时，侧边栏会标「原文已变更」。
-- 同一段原文的多条评论会叠加下划线/在侧边栏显示为多个卡片，属正常形态。
+- 同 quote 带 `merge:true` 的多条评论自动合并为一个线程（1 条原文下挂多条回复）；若线程已全部被「解决」，后续评论会新建线程。
 
 ## 边界
 
